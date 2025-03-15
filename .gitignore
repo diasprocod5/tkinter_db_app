@@ -3,3 +3,4 @@ tmp/
 temp/
 .idea/
 .venv/
+__pycache__/
