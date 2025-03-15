@@ -1,0 +1,969 @@
+CREATE TABLE tariffs (
+    tariff_id SERIAL PRIMARY KEY,
+    tariff_name VARCHAR(100) UNIQUE NOT NULL,
+    tariff_price DECIMAL(8,2) NOT NULL CHECK (tariff_price >= 0.00),
+    description TEXT NOT NULL
+);
+
+CREATE TABLE clients (
+    client_id SERIAL PRIMARY KEY,
+    full_name VARCHAR(60) NOT NULL,
+    phone VARCHAR(15) UNIQUE NOT NULL,
+    is_company BOOL NOT NULL,
+    created_at DATE DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE accounts (
+    account_id SERIAL PRIMARY KEY,
+    client_id INT REFERENCES clients(client_id) ON DELETE CASCADE,
+    tariff_id INT REFERENCES tariffs(tariff_id) ON DELETE SET NULL,
+    balance DECIMAL(8,2) NOT NULL DEFAULT 0.00,
+    paid_before DATE,
+    account_status VARCHAR(20) NOT NULL CHECK(account_status IN('active','blocked')) DEFAULT 'blocked',
+    account_type VARCHAR(20) NOT NULL CHECK(account_type IN('legal','private')),
+    created_at DATE DEFAULT CURRENT_DATE
+);
+
+CREATE TABLE debits (
+    debit_id SERIAL PRIMARY KEY,
+    account_id INT REFERENCES accounts(account_id) ON DELETE CASCADE,
+    amount DECIMAL(8,2) NOT NULL,
+    debit_date DATE DEFAULT CURRENT_DATE,
+    description TEXT
+);
+
+CREATE TABLE deposits (
+    deposit_id SERIAL PRIMARY KEY,
+    account_id INT REFERENCES accounts(account_id) ON DELETE CASCADE,
+    amount DECIMAL(8, 2) NOT NULL,
+    deposit_date DATE DEFAULT CURRENT_DATE,
+    description TEXT
+);
+
+
+INSERT INTO tariffs (tariff_name, tariff_price, description)
+VALUES
+    ('Базовый', 250.00, 'Базовый тариф с минимальным набором услуг: местные звонки, безлимит на звонки внутри сети.'),
+    ('Стандарт', 350.00, 'Стандартный тариф: местные и междугородние звонки, 100 минут на звонки за пределы сети.'),
+    ('Премиум', 650.00, 'Премиальный тариф: безлимитные местные и междугородние звонки, дополнительные услуги (голосовая почта, ожидание вызова).');
+
+
+-- ТРИГГЕРНАЯ ФУНКЦИЯ НА ПОПОЛНЕНИЕ
+
+CREATE OR REPLACE FUNCTION update_account_balance()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Обновляем баланс счета, добавляя сумму пополнения
+    UPDATE accounts
+    SET balance = balance + NEW.amount
+    WHERE account_id = NEW.account_id;
+
+    -- Возвращаем NEW, чтобы триггер завершился успешно
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_balance
+AFTER INSERT ON deposits
+FOR EACH ROW
+EXECUTE FUNCTION update_account_balance();
+
+---------------------------------------------------------
+
+
+
+
+-- ТРИГГЕРНАЯ ФУНКЦИЯ НА СПИСАНИЕ
+
+CREATE OR REPLACE FUNCTION update_account_balance_on_debit()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Обновляем баланс счета, вычитая сумму списания
+    UPDATE accounts
+    SET balance = balance - NEW.amount
+    WHERE account_id = NEW.account_id;
+
+    -- Возвращаем NEW, чтобы триггер завершился успешно
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_balance_on_debit
+AFTER INSERT ON debits
+FOR EACH ROW
+EXECUTE FUNCTION update_account_balance_on_debit();
+
+-------
+
+
+
+
+-- ТРИГГЕРНАЯ ФУНКЦИЯ, СПИСАНИЕ ПОСЛЕ СОЗДАНИЯ КЛИЕНТА
+
+CREATE OR REPLACE FUNCTION create_initial_debit()
+RETURNS TRIGGER AS $$
+DECLARE
+    debit_amount DECIMAL(8,2);
+BEGIN
+    -- Получаем стоимость тарифа
+    SELECT tariff_price INTO debit_amount
+    FROM tariffs
+    WHERE tariff_id = NEW.tariff_id;
+
+    -- Вставляем запись в таблицу debits
+    INSERT INTO debits (account_id, amount, description)
+    VALUES (NEW.account_id, debit_amount, 'Списание за подключение тарифа');
+
+    -- Обновляем баланс счета, вызывая логику второй функции
+    UPDATE accounts
+    SET balance = balance - debit_amount
+    WHERE account_id = NEW.account_id;
+
+    -- Возвращаем NEW, чтобы триггер завершился успешно
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_create_initial_debit
+AFTER INSERT ON accounts
+FOR EACH ROW
+EXECUTE FUNCTION create_initial_debit();
+
+
+--          ТРИГГЕРНАЯ ФУНЦИЯ НА ИЗМЕНЕНИЕ БАЛАНСА
+
+
+CREATE OR REPLACE FUNCTION update_account_status_on_balance_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Если баланс был положительный и стал отрицательный
+    IF OLD.balance >= 0 AND NEW.balance < 0 THEN
+        NEW.account_status := 'blocked';
+        NEW.paid_before := NULL;
+
+    -- Если баланс был отрицательный и стал положительный
+    ELSIF OLD.balance < 0 AND NEW.balance >= 0 THEN
+        NEW.account_status := 'active';
+        NEW.paid_before := CURRENT_DATE + INTERVAL '30 days';
+
+    -- Если баланс был положительный и остался положительный, и paid_before равен текущей дате
+    ELSIF OLD.balance >= 0 AND NEW.balance >= 0 AND NEW.paid_before = CURRENT_DATE THEN
+        NEW.paid_before := CURRENT_DATE + INTERVAL '30 days';
+    END IF;
+
+    -- Возвращаем обновленную запись
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_account_status
+BEFORE UPDATE ON accounts
+FOR EACH ROW
+EXECUTE FUNCTION update_account_status_on_balance_change();
+
+
+-- 3.а Составной многотабличный запрос с CASE-выражением;
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    c.phone,
+    c.is_company,
+    a.account_id,
+    a.balance,
+    a.account_status,
+    a.account_type,
+    t.tariff_name,
+    t.tariff_price,
+    CASE
+        WHEN a.balance >= 0 THEN 'Положительный баланс'
+        WHEN a.balance < 0 THEN 'Отрицательный баланс'
+    END AS balance_status,
+    CASE
+        WHEN a.balance >= 1000 THEN 'Премиальный клиент'
+        WHEN a.balance >= 500 AND a.balance < 1000 THEN 'Стандартный клиент'
+        WHEN a.balance >= 0 AND a.balance < 500 THEN 'Экономный клиент'
+        ELSE 'Задолженность'
+    END AS client_category,
+    COALESCE(SUM(dep.amount), 0) AS total_deposits,
+    COALESCE(SUM(deb.amount), 0) AS total_debits
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id
+    LEFT JOIN tariffs t ON a.tariff_id = t.tariff_id
+    LEFT JOIN deposits dep ON a.account_id = dep.account_id
+    LEFT JOIN debits deb ON a.account_id = deb.account_id
+GROUP BY
+    c.client_id,
+    c.full_name,
+    c.phone,
+    c.is_company,
+    a.account_id,
+    a.balance,
+    a.account_status,
+    a.account_type,
+    t.tariff_name,
+    t.tariff_price
+ORDER BY
+    c.client_id;
+
+
+
+-- 3.b  Многотабличный VIEW, с возможностью его обновления (использовать триггеры или правила);
+CREATE VIEW client_accounts_summary AS
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    c.phone,
+    c.is_company,
+    a.account_id,
+    a.balance,
+    a.account_status,
+    a.account_type,
+    t.tariff_name,
+    t.tariff_price,
+    COALESCE(SUM(dep.amount), 0) AS total_deposits,
+    COALESCE(SUM(deb.amount), 0) AS total_debits
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id
+    LEFT JOIN tariffs t ON a.tariff_id = t.tariff_id
+    LEFT JOIN deposits dep ON a.account_id = dep.account_id
+    LEFT JOIN debits deb ON a.account_id = deb.account_id
+GROUP BY
+    c.client_id,
+    c.full_name,
+    c.phone,
+    c.is_company,
+    a.account_id,
+    a.balance,
+    a.account_status,
+    a.account_type,
+    t.tariff_name,
+    t.tariff_price;
+
+
+
+-- INSERT
+CREATE OR REPLACE FUNCTION insert_client_account_summary()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Вставляем данные в таблицу clients
+    INSERT INTO clients (full_name, phone, is_company)
+    VALUES (NEW.client_name, NEW.phone, NEW.is_company)
+    RETURNING client_id INTO NEW.client_id;
+
+    -- Вставляем данные в таблицу accounts
+    INSERT INTO accounts (client_id, tariff_id, balance, account_status, account_type)
+    VALUES (
+        NEW.client_id,
+        (SELECT tariff_id FROM tariffs WHERE tariff_name = NEW.tariff_name),
+        NEW.balance,
+        NEW.account_status,
+        NEW.account_type
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_insert_client_account_summary
+INSTEAD OF INSERT ON client_accounts_summary
+FOR EACH ROW
+EXECUTE FUNCTION insert_client_account_summary();
+
+-- UPDATE
+CREATE OR REPLACE FUNCTION update_client_account_summary()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Обновляем данные в таблице clients
+    UPDATE clients
+    SET
+        full_name = NEW.client_name,
+        phone = NEW.phone,
+        is_company = NEW.is_company
+    WHERE client_id = OLD.client_id;
+
+    -- Обновляем данные в таблице accounts
+    UPDATE accounts
+    SET
+        tariff_id = (SELECT tariff_id FROM tariffs WHERE tariff_name = NEW.tariff_name),
+        balance = NEW.balance,
+        account_status = NEW.account_status,
+        account_type = NEW.account_type
+    WHERE account_id = OLD.account_id;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_update_client_account_summary
+INSTEAD OF UPDATE ON client_accounts_summary
+FOR EACH ROW
+EXECUTE FUNCTION update_client_account_summary();
+
+
+-- DELETE
+CREATE OR REPLACE FUNCTION delete_client_account_summary()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Удаляем данные из таблицы accounts
+    DELETE FROM accounts WHERE account_id = OLD.account_id;
+
+    -- Удаляем данные из таблицы clients
+    DELETE FROM clients WHERE client_id = OLD.client_id;
+
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_delete_client_account_summary
+INSTEAD OF DELETE ON client_accounts_summary
+FOR EACH ROW
+EXECUTE FUNCTION delete_client_account_summary();
+
+
+-- Вставка данных через VIEW
+INSERT INTO client_accounts_summary (client_name, phone, is_company, balance, account_status, account_type, tariff_name)
+VALUES ('Сидоров Алексей', '+79991112233', FALSE, 500.00, 'active', 'private', 'Базовый');
+
+-- Обновление данных через VIEW
+UPDATE client_accounts_summary
+SET balance = 1000.00, account_status = 'active'
+WHERE client_id = 1;
+
+-- Удаление данных через VIEW
+DELETE FROM client_accounts_summary
+WHERE client_id = 1;
+
+
+
+-- 3.c Материализованное представление;
+
+CREATE MATERIALIZED VIEW client_accounts_summary_mv AS
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    c.phone,
+    c.is_company,
+    a.account_id,
+    a.balance,
+    a.account_status,
+    a.account_type,
+    t.tariff_name,
+    t.tariff_price,
+    COALESCE(SUM(dep.amount), 0) AS total_deposits,
+    COALESCE(SUM(deb.amount), 0) AS total_debits
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id
+    LEFT JOIN tariffs t ON a.tariff_id = t.tariff_id
+    LEFT JOIN deposits dep ON a.account_id = dep.account_id
+    LEFT JOIN debits deb ON a.account_id = deb.account_id
+GROUP BY
+    c.client_id,
+    c.full_name,
+    c.phone,
+    c.is_company,
+    a.account_id,
+    a.balance,
+    a.account_status,
+    a.account_type,
+    t.tariff_name,
+    t.tariff_price;
+
+REFRESH MATERIALIZED VIEW client_accounts_summary_mv;
+
+SELECT * FROM client_accounts_summary_mv;
+
+SELECT * FROM client_accounts_summary_mv
+WHERE balance < 0;
+
+SELECT * FROM client_accounts_summary_mv
+ORDER BY balance DESC;
+
+
+
+
+-- 3.d Запросы, содержащие подзапрос в разделах SELECT, FROM и WHERE (в каждом хотя бы по одному);
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    a.balance,
+    (SELECT AVG(balance) FROM accounts) AS average_balance
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id;
+
+
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    a.balance
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id
+    JOIN (SELECT AVG(balance) AS avg_balance FROM accounts) AS avg_table
+WHERE
+    a.balance > avg_table.avg_balance;
+
+
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name
+FROM
+    clients c
+WHERE
+    c.client_id IN (SELECT DISTINCT account_id FROM deposits);
+
+
+-- 3.e Коррелированные подзапросы (минимум 3 запроса)
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    a.balance,
+    a.balance - (SELECT AVG(balance) FROM accounts a2 WHERE a2.client_id = a.client_id) AS balance_diff_from_avg
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id;
+
+
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    a.balance
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id
+WHERE
+    a.balance > (SELECT AVG(balance) FROM accounts a2 WHERE a2.client_id = a.client_id);
+
+
+
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name,
+    SUM(d.amount) AS total_deposits
+FROM
+    clients c
+    JOIN accounts a ON c.client_id = a.client_id
+    JOIN deposits d ON a.account_id = d.account_id
+GROUP BY
+    c.client_id,
+    c.full_name
+HAVING
+    SUM(d.amount) > (SELECT AVG(total_deposits) FROM (SELECT SUM(d2.amount) AS total_deposits FROM deposits d2 GROUP BY d2.account_id) AS avg_deposits);
+
+
+
+
+-- 3.f Многотабличный запрос, содержащий группировку записей, агрегатные функции и параметр, используемый в разделе HAVING;
+
+SELECT
+    a.account_type,
+    SUM(COALESCE(d.amount, 0)) AS total_deposits,
+    SUM(COALESCE(deb.amount, 0)) AS total_debits
+FROM
+    accounts a
+    LEFT JOIN deposits d ON a.account_id = d.account_id
+    LEFT JOIN debits deb ON a.account_id = deb.account_id
+GROUP BY
+    a.account_type
+HAVING
+    SUM(COALESCE(d.amount, 0)) > 1000;
+
+
+-- 3.g Запросы, содержащие предикаты ANY и ALL (для каждого предиката);
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name
+FROM
+    clients c
+WHERE
+    c.client_id = ANY (
+        SELECT a.client_id
+        FROM accounts a
+        JOIN deposits d ON a.account_id = d.account_id
+        WHERE d.amount > 500
+    );
+
+
+SELECT
+    c.client_id,
+    c.full_name AS client_name
+FROM
+    clients c
+WHERE
+    100 < ALL (
+        SELECT d.amount
+        FROM accounts a
+        JOIN deposits d ON a.account_id = d.account_id
+        WHERE a.client_id = c.client_id
+    );
+
+-- 4 СОЗДАНИЕ ИНДЕКСОВ
+CREATE INDEX idx_clients_phone ON clients(phone);
+EXPLAIN ANALYZE
+SELECT * FROM clients WHERE phone = '+79991234567';
+
+
+CREATE INDEX idx_accounts_active ON accounts(account_status) WHERE account_status = 'active';
+EXPLAIN ANALYZE
+SELECT * FROM accounts WHERE account_status = 'active';
+
+CREATE INDEX idx_clients_lower_name ON clients(LOWER(full_name));
+EXPLAIN ANALYZE
+SELECT * FROM clients WHERE LOWER(full_name) = 'иванов иван';
+
+
+
+
+
+-- 7. Операции добавления, удаления и обновления реализовать в виде хранимых процедур или функций с параметрами для всех таблиц;
+CREATE OR REPLACE FUNCTION add_client(
+    p_full_name VARCHAR(60),
+    p_phone VARCHAR(15),
+    p_is_company BOOL
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO clients (full_name, phone, is_company)
+    VALUES (p_full_name, p_phone, p_is_company);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_client(
+    p_client_id INT,
+    p_full_name VARCHAR(60),
+    p_phone VARCHAR(15),
+    p_is_company BOOL
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE clients
+    SET
+        full_name = p_full_name,
+        phone = p_phone,
+        is_company = p_is_company
+    WHERE client_id = p_client_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION delete_client(
+    p_client_id INT
+) RETURNS VOID AS $$
+BEGIN
+    DELETE FROM clients WHERE client_id = p_client_id;
+END;
+$$ LANGUAGE plpgsql;
+
+
+CREATE OR REPLACE FUNCTION add_tariff(
+    p_tariff_name VARCHAR(100),
+    p_tariff_price DECIMAL(8,2),
+    p_description TEXT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO tariffs (tariff_name, tariff_price, description)
+    VALUES (p_tariff_name, p_tariff_price, p_description);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_tariff(
+    p_tariff_id INT,
+    p_tariff_name VARCHAR(100),
+    p_tariff_price DECIMAL(8,2),
+    p_description TEXT
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE tariffs
+    SET
+        tariff_name = p_tariff_name,
+        tariff_price = p_tariff_price,
+        description = p_description
+    WHERE tariff_id = p_tariff_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION delete_tariff(
+    p_tariff_id INT
+) RETURNS VOID AS $$
+BEGIN
+    DELETE FROM tariffs WHERE tariff_id = p_tariff_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION add_account(
+    p_client_id INT,
+    p_tariff_id INT,
+    p_balance DECIMAL(8,2),
+    p_account_status VARCHAR(20),
+    p_account_type VARCHAR(20)
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO accounts (client_id, tariff_id, balance, account_status, account_type)
+    VALUES (p_client_id, p_tariff_id, p_balance, p_account_status, p_account_type);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_account(
+    p_account_id INT,
+    p_client_id INT,
+    p_tariff_id INT,
+    p_balance DECIMAL(8,2),
+    p_account_status VARCHAR(20),
+    p_account_type VARCHAR(20)
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE accounts
+    SET
+        client_id = p_client_id,
+        tariff_id = p_tariff_id,
+        balance = p_balance,
+        account_status = p_account_status,
+        account_type = p_account_type
+    WHERE account_id = p_account_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION delete_account(
+    p_account_id INT
+) RETURNS VOID AS $$
+BEGIN
+    DELETE FROM accounts WHERE account_id = p_account_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION add_deposit(
+    p_account_id INT,
+    p_amount DECIMAL(8,2),
+    p_description TEXT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO deposits (account_id, amount, description)
+    VALUES (p_account_id, p_amount, p_description);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_deposit(
+    p_deposit_id INT,
+    p_account_id INT,
+    p_amount DECIMAL(8,2),
+    p_description TEXT
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE deposits
+    SET
+        account_id = p_account_id,
+        amount = p_amount,
+        description = p_description
+    WHERE deposit_id = p_deposit_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION delete_deposit(
+    p_deposit_id INT
+) RETURNS VOID AS $$
+BEGIN
+    DELETE FROM deposits WHERE deposit_id = p_deposit_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION add_debit(
+    p_account_id INT,
+    p_amount DECIMAL(8,2),
+    p_description TEXT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO debits (account_id, amount, description)
+    VALUES (p_account_id, p_amount, p_description);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION update_debit(
+    p_debit_id INT,
+    p_account_id INT,
+    p_amount DECIMAL(8,2),
+    p_description TEXT
+) RETURNS VOID AS $$
+BEGIN
+    UPDATE debits
+    SET
+        account_id = p_account_id,
+        amount = p_amount,
+        description = p_description
+    WHERE debit_id = p_debit_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION delete_debit(
+    p_debit_id INT
+) RETURNS VOID AS $$
+BEGIN
+    DELETE FROM debits WHERE debit_id = p_debit_id;
+END;
+$$ LANGUAGE plpgsql;
+
+
+SELECT add_client('Иванов Иван', '+79991234567', FALSE);
+SELECT update_client(1, 'Иванов Иван Иванович', '+79991234567', FALSE);
+SELECT delete_client(1);
+
+SELECT add_tariff('Базовый', 250.00, 'Базовый тариф с минимальным набором услуг.');
+SELECT update_tariff(1, 'Базовый+', 300.00, 'Базовый тариф с расширенными услугами.');
+SELECT delete_tariff(1);
+
+SELECT add_account(1, 1, 0.00, 'active', 'private');
+SELECT update_account(1, 1, 1, 500.00, 'active', 'private');
+SELECT delete_account(1);
+
+SELECT add_deposit(1, 1000.00, 'Пополнение счета');
+SELECT update_deposit(1, 1, 1500.00, 'Пополнение счета');
+SELECT delete_deposit(1);
+
+SELECT add_debit(1, 200.00, 'Списание за услуги');
+SELECT update_debit(1, 1, 250.00, 'Списание за услуги');
+SELECT delete_debit(1);
+
+-- 8 Реализовать отдельную хранимую процедуру, состоящую из нескольких отдельныхопераций в виде единой транзакции, которая при определенных условиях может
+-- быть зафиксирована или откатана;
+
+CREATE OR REPLACE PROCEDURE create_client_with_account(
+    p_full_name VARCHAR(60),
+    p_phone VARCHAR(15),
+    p_is_company BOOL,
+    p_tariff_id INT,
+    p_initial_balance DECIMAL(8,2)
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_client_id INT;
+    v_account_id INT;
+BEGIN
+    -- Начало транзакции
+    BEGIN
+        -- Добавление клиента
+        INSERT INTO clients (full_name, phone, is_company)
+        VALUES (p_full_name, p_phone, p_is_company)
+        RETURNING client_id INTO v_client_id;
+
+        -- Создание счета для клиента
+        INSERT INTO accounts (client_id, tariff_id, balance, account_status, account_type)
+        VALUES (v_client_id, p_tariff_id, 0.00, 'active', 'private')
+        RETURNING account_id INTO v_account_id;
+
+        -- Пополнение счета
+        INSERT INTO deposits (account_id, amount, description)
+        VALUES (v_account_id, p_initial_balance, 'Первоначальное пополнение');
+
+        -- Фиксация транзакции
+        COMMIT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            -- Откат транзакции в случае ошибки
+            ROLLBACK;
+            RAISE EXCEPTION 'Ошибка при создании клиента и счета: %', SQLERRM;
+    END;
+END;
+$$;
+
+
+ -- пример
+CALL create_client_with_account(
+    'Сидоров Алексей',
+    '+79991112233',
+    FALSE,
+    1,
+    1000.00
+);
+
+
+
+-- 9 Реализовать курсор на обновления отдельных данных (вычисления значения полей выбранной таблицы);
+
+CREATE OR REPLACE FUNCTION update_account_balances() RETURNS VOID AS $$
+DECLARE
+    -- Объявляем переменные
+    v_account_id INT;
+    v_balance DECIMAL(8,2);
+    v_total_deposits DECIMAL(8,2);
+    v_total_debits DECIMAL(8,2);
+
+    -- Объявляем курсор
+    cur_accounts CURSOR FOR
+        SELECT a.account_id
+        FROM accounts a;
+BEGIN
+    -- Открываем курсор
+    OPEN cur_accounts;
+
+    -- Начинаем цикл по строкам курсора
+    LOOP
+        -- Получаем следующую строку из курсора
+        FETCH cur_accounts INTO v_account_id;
+        EXIT WHEN NOT FOUND;  -- Выход из цикла, если строк больше нет
+
+        -- Вычисляем общую сумму пополнений для текущего счета
+        SELECT COALESCE(SUM(amount), 0) INTO v_total_deposits
+        FROM deposits
+        WHERE account_id = v_account_id;
+
+        -- Вычисляем общую сумму списаний для текущего счета
+        SELECT COALESCE(SUM(amount), 0) INTO v_total_debits
+        FROM debits
+        WHERE account_id = v_account_id;
+
+        -- Вычисляем новый баланс
+        v_balance := v_total_deposits - v_total_debits;
+
+        -- Обновляем баланс счета
+        UPDATE accounts
+        SET balance = v_balance
+        WHERE account_id = v_account_id;
+    END LOOP;
+
+    -- Закрываем курсор
+    CLOSE cur_accounts;
+END;
+$$ LANGUAGE plpgsql;
+
+
+
+SELECT update_account_balances();
+
+
+
+-- 10 Реализовать собственную скалярную и векторную функции. Функции сохранить в базе данных;
+
+
+CREATE OR REPLACE FUNCTION get_client_balance(p_client_id INT)
+RETURNS DECIMAL(8,2) AS $$
+DECLARE
+    v_balance DECIMAL(8,2);
+BEGIN
+    -- Получаем баланс счета клиента
+    SELECT balance INTO v_balance
+    FROM accounts
+    WHERE client_id = p_client_id;
+
+    -- Возвращаем результат
+    RETURN COALESCE(v_balance, 0.00);  -- Если счет не найден, возвращаем 0
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT get_client_balance(1);
+
+
+CREATE OR REPLACE FUNCTION get_client_account_info(p_client_id INT)
+RETURNS TABLE (
+    balance DECIMAL(8,2),
+    account_status VARCHAR(20),
+    account_type VARCHAR(20)
+) AS $$
+BEGIN
+    -- Возвращаем информацию о счете клиента
+    RETURN QUERY
+    SELECT a.balance, a.account_status, a.account_type
+    FROM accounts a
+    WHERE a.client_id = p_client_id;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT * FROM get_client_account_info(1);
+
+
+SELECT proname, prosrc
+FROM pg_proc
+WHERE proname IN ('get_client_balance', 'get_client_account_info');
+
+
+
+
+-- 11 Распределение прав пользователей: предусмотреть не менее двух пользователей с разным набором привилегий. Каждый набор привилегий оформить в виде роли.
+
+CREATE ROLE manager;
+
+-- Привилегии на чтение
+GRANT SELECT ON clients, accounts, tariffs, deposits, debits TO manager;
+
+-- Привилегии на изменение данных
+GRANT INSERT, UPDATE, DELETE ON clients, accounts TO manager;
+
+
+
+CREATE ROLE analyst;
+
+-- Привилегии на чтение
+GRANT SELECT ON clients, accounts, tariffs, deposits, debits TO analyst;
+
+
+CREATE USER manager_user WITH PASSWORD 'manager_password';
+GRANT manager TO manager_user;
+
+
+CREATE USER analyst_user WITH PASSWORD 'analyst_password';
+GRANT analyst TO analyst_user;
+
+
+-- Подключаемся от имени manager_user
+SET ROLE manager_user;
+SELECT * FROM clients;
+
+INSERT INTO clients (full_name, phone, is_company)
+VALUES ('Иванов Иван', '+79991234567', FALSE);
+
+DELETE FROM clients WHERE client_id = 1;
+
+
+-- Подключаемся от имени analyst_user
+SET ROLE analyst_user;
+SELECT * FROM clients;
+
+SELECT client_id, SUM(balance) AS total_balance
+FROM accounts
+GROUP BY client_id;
+
+SELECT rolname FROM pg_roles;
+
+SELECT * FROM information_schema.role_table_grants
+WHERE grantee = 'manager';
+
+
+
+-- 12. Предусмотреть в курсовой работе минимум одну таблицу для хранения исторических данных (OLAP)
+
+
+CREATE TABLE accounts_history (
+    history_id SERIAL PRIMARY KEY,  -- Уникальный идентификатор записи
+    account_id INT NOT NULL,        -- Ссылка на счет
+    old_balance DECIMAL(8,2),       -- Старый баланс
+    new_balance DECIMAL(8,2),       -- Новый баланс
+    change_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  -- Дата изменения
+    changed_by VARCHAR(50)          -- Пользователь, внесший изменение
+);
+
+CREATE OR REPLACE FUNCTION log_account_balance_change()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Если баланс изменился, добавляем запись в историческую таблицу
+    IF OLD.balance IS DISTINCT FROM NEW.balance THEN
+        INSERT INTO accounts_history (account_id, old_balance, new_balance, changed_by)
+        VALUES (OLD.account_id, OLD.balance, NEW.balance, CURRENT_USER);
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Создаем триггер
+CREATE TRIGGER trigger_account_balance_change
+AFTER UPDATE ON accounts
+FOR EACH ROW
+EXECUTE FUNCTION log_account_balance_change();
+
+UPDATE accounts
+SET balance = 700.00
+WHERE account_id = 1;
